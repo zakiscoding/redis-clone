@@ -46,6 +46,7 @@ typedef struct {
     long long last_stream_sequence;
     int64_t expires_at_ms;
     int used;
+    unsigned long long version;
 } Entry;
 
 typedef struct {
@@ -54,15 +55,27 @@ typedef struct {
 } QueuedCommand;
 
 typedef struct {
+    char *key;
+    unsigned long long version;
+} WatchedKey;
+
+typedef struct {
     int fd;
     int in_multi;
     int executing;
     QueuedCommand *queue;
     size_t queue_count;
     size_t queue_capacity;
+    WatchedKey *watched;
+    size_t watched_count;
+    size_t watched_capacity;
 } ClientState;
 
 static Entry store[MAX_KEYS];
+static struct {
+    char *key;
+    unsigned long long version;
+} key_versions[MAX_KEYS];
 static int configured_port = PORT;
 static long long replication_offset = 0;
 static const char *replication_id = "8371b4fb1155b71f4a04d3e1bc3e18c8";
@@ -85,6 +98,28 @@ static void free_entry(Entry *entry) {
     }
     free(entry->records);
     memset(entry, 0, sizeof(*entry));
+}
+
+static unsigned long long key_version(const char *key) {
+    for (size_t i = 0; i < MAX_KEYS; i++)
+        if (key_versions[i].key && strcmp(key_versions[i].key, key) == 0) return key_versions[i].version;
+    return 0;
+}
+
+static void bump_version(const char *key) {
+    for (size_t i = 0; i < MAX_KEYS; i++) {
+        if (key_versions[i].key && strcmp(key_versions[i].key, key) == 0) {
+            key_versions[i].version++;
+            return;
+        }
+    }
+    for (size_t i = 0; i < MAX_KEYS; i++) {
+        if (!key_versions[i].key) {
+            key_versions[i].key = strdup(key);
+            key_versions[i].version = 1;
+            return;
+        }
+    }
 }
 
 static Entry *find_entry(const char *key) {
@@ -237,6 +272,20 @@ static void clear_queue(ClientState *client) {
     client->queue_capacity = 0;
 }
 
+static void clear_watches(ClientState *client) {
+    for (size_t i = 0; i < client->watched_count; i++) free(client->watched[i].key);
+    free(client->watched);
+    client->watched = NULL;
+    client->watched_count = 0;
+    client->watched_capacity = 0;
+}
+
+static int watches_changed(const ClientState *client) {
+    for (size_t i = 0; i < client->watched_count; i++)
+        if (key_version(client->watched[i].key) != client->watched[i].version) return 1;
+    return 0;
+}
+
 static int queue_command(ClientState *client, char **args, size_t count) {
     if (client->queue_count == client->queue_capacity) {
         size_t capacity = client->queue_capacity ? client->queue_capacity * 2 : 8;
@@ -277,6 +326,8 @@ static int parse_integer(const char *text, long long *value) {
     return errno == 0 && *text != '\0' && *end == '\0';
 }
 
+static void command(ClientState *client, char **args, size_t count);
+
 static void command(ClientState *client, char **args, size_t count) {
     int fd = client->fd;
     if (client->in_multi && !client->executing &&
@@ -299,6 +350,7 @@ static void command(ClientState *client, char **args, size_t count) {
         else {
             client->in_multi = 0;
             clear_queue(client);
+            clear_watches(client);
             reply_simple(fd, "OK");
         }
         return;
@@ -306,6 +358,13 @@ static void command(ClientState *client, char **args, size_t count) {
     if (equals(args[0], "EXEC") && count == 1) {
         if (!client->in_multi) {
             reply_error(fd, "EXEC without MULTI");
+            return;
+        }
+        if (watches_changed(client)) {
+            client->in_multi = 0;
+            clear_queue(client);
+            clear_watches(client);
+            reply_null_array(fd);
             return;
         }
         reply_array_header(fd, (long long)client->queue_count);
@@ -316,6 +375,39 @@ static void command(ClientState *client, char **args, size_t count) {
         client->executing = 0;
         client->in_multi = 0;
         clear_queue(client);
+        clear_watches(client);
+        return;
+    }
+    if (equals(args[0], "WATCH") && count >= 2) {
+        if (client->in_multi) {
+            reply_error(fd, "WATCH inside MULTI is not allowed");
+            return;
+        }
+        for (size_t i = 1; i < count; i++) {
+            int already_watched = 0;
+            for (size_t j = 0; j < client->watched_count; j++) {
+                if (strcmp(client->watched[j].key, args[i]) == 0) {
+                    client->watched[j].version = key_version(args[i]);
+                    already_watched = 1;
+                    break;
+                }
+            }
+            if (already_watched) continue;
+            if (client->watched_count == client->watched_capacity) {
+                size_t capacity = client->watched_capacity ? client->watched_capacity * 2 : 8;
+                WatchedKey *watched = realloc(client->watched, capacity * sizeof(*watched));
+                if (!watched) { reply_error(fd, "out of memory"); return; }
+                client->watched = watched;
+                client->watched_capacity = capacity;
+            }
+            client->watched[client->watched_count++] = (WatchedKey){strdup(args[i]), key_version(args[i])};
+        }
+        reply_simple(fd, "OK");
+        return;
+    }
+    if (equals(args[0], "UNWATCH") && count == 1) {
+        clear_watches(client);
+        reply_simple(fd, "OK");
         return;
     }
     if (equals(args[0], "PING")) {
@@ -400,6 +492,7 @@ static void command(ClientState *client, char **args, size_t count) {
         free(entry->string);
         entry->string = strdup(args[2]);
         entry->expires_at_ms = expiry;
+        bump_version(args[1]);
         replication_offset += (long long)count;
         reply_simple(fd, "OK");
         return;
@@ -430,6 +523,7 @@ static void command(ClientState *client, char **args, size_t count) {
             free(entry->string);
             entry->string = strdup(args[i + 1]);
             entry->expires_at_ms = 0;
+            bump_version(args[i]);
         }
         reply_simple(fd, "OK");
         return;
@@ -438,7 +532,7 @@ static void command(ClientState *client, char **args, size_t count) {
         long removed = 0;
         for (size_t i = 1; i < count; i++) {
             Entry *entry = find_entry(args[i]);
-            if (entry) { free_entry(entry); removed++; }
+            if (entry) { bump_version(args[i]); free_entry(entry); removed++; }
         }
         reply_integer(fd, removed);
         return;
@@ -492,6 +586,7 @@ static void command(ClientState *client, char **args, size_t count) {
         }
         entry->last_stream_ms = milliseconds;
         entry->last_stream_sequence = sequence;
+        bump_version(args[1]);
         reply_stream_id(fd, milliseconds, sequence);
         return;
     }
@@ -571,6 +666,7 @@ static void command(ClientState *client, char **args, size_t count) {
         snprintf(number, sizeof(number), "%lld", value);
         free(entry->string);
         entry->string = strdup(number);
+        bump_version(args[1]);
         reply_integer(fd, value);
         return;
     }
@@ -589,6 +685,7 @@ static void command(ClientState *client, char **args, size_t count) {
         snprintf(number, sizeof(number), "%lld", value);
         free(entry->string);
         entry->string = strdup(number);
+        bump_version(args[1]);
         reply_integer(fd, value);
         return;
     }
@@ -601,6 +698,7 @@ static void command(ClientState *client, char **args, size_t count) {
         if (!value) { reply_error(fd, "out of memory"); return; }
         memcpy(value + old_length, args[2], added_length + 1);
         entry->string = value;
+        bump_version(args[1]);
         reply_integer(fd, (long long)(old_length + added_length));
         return;
     }
@@ -618,6 +716,7 @@ static void command(ClientState *client, char **args, size_t count) {
         if (!entry) reply_integer(fd, 0);
         else {
             entry->expires_at_ms = now_ms() + duration * (equals(args[0], "EXPIRE") ? 1000 : 1);
+            bump_version(args[1]);
             if (duration <= 0) free_entry(entry);
             reply_integer(fd, 1);
         }
@@ -629,7 +728,7 @@ static void command(ClientState *client, char **args, size_t count) {
         else if (entry->expires_at_ms == 0) reply_integer(fd, -1);
         else {
             int64_t remaining = entry->expires_at_ms - now_ms();
-            if (remaining <= 0) { free_entry(entry); reply_integer(fd, -2); }
+            if (remaining <= 0) { bump_version(args[1]); free_entry(entry); reply_integer(fd, -2); }
             else reply_integer(fd, equals(args[0], "TTL") ? (remaining + 999) / 1000 : remaining);
         }
         return;
@@ -658,6 +757,7 @@ static void command(ClientState *client, char **args, size_t count) {
             for (size_t i = 0; i < added; i++) entry->items[entry->count + i] = (Item){strdup(args[i + 2]), strlen(args[i + 2])};
         }
         entry->count += added;
+        bump_version(args[1]);
         reply_integer(fd, (long long)entry->count);
         return;
     }
@@ -703,11 +803,15 @@ static void command(ClientState *client, char **args, size_t count) {
             memmove(entry->items, entry->items + amount, (entry->count - (size_t)amount) * sizeof(*entry->items));
         }
         entry->count -= (size_t)amount;
+        bump_version(args[1]);
         if (entry->count == 0) free_entry(entry);
         return;
     }
     if (equals(args[0], "FLUSHALL") && count == 1) {
-        for (size_t i = 0; i < MAX_KEYS; i++) free_entry(&store[i]);
+        for (size_t i = 0; i < MAX_KEYS; i++) {
+            if (store[i].used) bump_version(store[i].key);
+            free_entry(&store[i]);
+        }
         reply_simple(fd, "OK");
         return;
     }
@@ -779,6 +883,7 @@ int main(int argc, char **argv) {
             if (!read_command(clients[i].fd, args, &count)) {
                 close(clients[i].fd);
                 clear_queue(&clients[i]);
+                clear_watches(&clients[i]);
                 clients[i].fd = -1;
                 free_args(args, count);
                 continue;
