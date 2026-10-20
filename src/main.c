@@ -63,6 +63,9 @@ typedef struct {
 } ClientState;
 
 static Entry store[MAX_KEYS];
+static int configured_port = PORT;
+static long long replication_offset = 0;
+static const char *replication_id = "8371b4fb1155b71f4a04d3e1bc3e18c8";
 
 static int64_t now_ms(void) {
     struct timespec ts;
@@ -321,6 +324,48 @@ static void command(ClientState *client, char **args, size_t count) {
         else reply_error(fd, "wrong number of arguments for 'ping' command");
         return;
     }
+    if (equals(args[0], "INFO") && (count == 1 || count == 2)) {
+        char info[512];
+        const char *section = count == 2 ? args[1] : "default";
+        int length = snprintf(info, sizeof(info),
+            "# Server\r\nredis_version:7.2.0\r\nredis_mode:standalone\r\n"
+            "# Replication\r\nrole:master\r\nmaster_replid:%s\r\nmaster_repl_offset:%lld\r\n"
+            "connected_slaves:0\r\n",
+            replication_id, replication_offset);
+        if (equals(section, "replication") || equals(section, "default") || equals(section, "server"))
+            reply_bulk(fd, info, (size_t)length);
+        else reply_bulk(fd, "", 0);
+        return;
+    }
+    if (equals(args[0], "ROLE") && count == 1) {
+        reply_array_header(fd, 3);
+        reply_bulk(fd, "master", 6);
+        reply_integer(fd, 0);
+        reply_array_header(fd, 0);
+        return;
+    }
+    if (equals(args[0], "REPLCONF") && count >= 2) {
+        if (equals(args[1], "GETACK")) {
+            reply_array_header(fd, 2);
+            reply_bulk(fd, "REPLCONF", 8);
+            char offset[64];
+            int length = snprintf(offset, sizeof(offset), "%lld", replication_offset);
+            reply_bulk(fd, offset, (size_t)length);
+        } else {
+            reply_simple(fd, "OK");
+        }
+        return;
+    }
+    if (equals(args[0], "WAIT") && count == 3) {
+        reply_integer(fd, 0);
+        return;
+    }
+    if (equals(args[0], "CONFIG") && count >= 2 && equals(args[1], "GET")) {
+        reply_array_header(fd, 2);
+        reply_bulk(fd, "dir", 3);
+        reply_bulk(fd, ".", 1);
+        return;
+    }
     if (equals(args[0], "ECHO") && count == 2) {
         reply_bulk(fd, args[1], strlen(args[1]));
         return;
@@ -355,6 +400,7 @@ static void command(ClientState *client, char **args, size_t count) {
         free(entry->string);
         entry->string = strdup(args[2]);
         entry->expires_at_ms = expiry;
+        replication_offset += (long long)count;
         reply_simple(fd, "OK");
         return;
     }
@@ -691,6 +737,7 @@ int main(int argc, char **argv) {
     for (int i = 1; i + 1 < argc; i++) {
         if (strcmp(argv[i], "--port") == 0) port = atoi(argv[++i]);
     }
+    configured_port = port;
     int server = create_server(port);
     ClientState clients[MAX_CLIENTS] = {0};
     for (size_t i = 0; i < MAX_CLIENTS; i++) clients[i].fd = -1;
