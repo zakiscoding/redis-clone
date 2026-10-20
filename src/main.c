@@ -1,5 +1,6 @@
 #include <arpa/inet.h>
 #include <errno.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdint.h>
@@ -17,12 +18,19 @@
 #define MAX_ARGS 64
 #define MAX_VALUE 1024 * 1024
 
-typedef enum { VALUE_STRING, VALUE_LIST } ValueType;
+typedef enum { VALUE_STRING, VALUE_LIST, VALUE_STREAM } ValueType;
 
 typedef struct {
     char *data;
     size_t length;
 } Item;
+
+typedef struct {
+    long long milliseconds;
+    long long sequence;
+    Item *fields;
+    size_t field_count;
+} StreamRecord;
 
 typedef struct {
     char *key;
@@ -31,9 +39,28 @@ typedef struct {
     Item *items;
     size_t count;
     size_t capacity;
+    StreamRecord *records;
+    size_t record_count;
+    size_t record_capacity;
+    long long last_stream_ms;
+    long long last_stream_sequence;
     int64_t expires_at_ms;
     int used;
 } Entry;
+
+typedef struct {
+    char **args;
+    size_t count;
+} QueuedCommand;
+
+typedef struct {
+    int fd;
+    int in_multi;
+    int executing;
+    QueuedCommand *queue;
+    size_t queue_count;
+    size_t queue_capacity;
+} ClientState;
 
 static Entry store[MAX_KEYS];
 
@@ -49,6 +76,11 @@ static void free_entry(Entry *entry) {
     free(entry->string);
     for (size_t i = 0; i < entry->count; i++) free(entry->items[i].data);
     free(entry->items);
+    for (size_t i = 0; i < entry->record_count; i++) {
+        for (size_t j = 0; j < entry->records[i].field_count; j++) free(entry->records[i].fields[j].data);
+        free(entry->records[i].fields);
+    }
+    free(entry->records);
     memset(entry, 0, sizeof(*entry));
 }
 
@@ -121,6 +153,22 @@ static void reply_null_array(int fd) {
     send_all(fd, "*-1\r\n", 5);
 }
 
+static void reply_stream_id(int fd, long long milliseconds, long long sequence) {
+    char id[64];
+    int length = snprintf(id, sizeof(id), "%lld-%lld", milliseconds, sequence);
+    reply_bulk(fd, id, (size_t)length);
+}
+
+static int parse_stream_id(const char *text, long long *milliseconds, long long *sequence) {
+    char *separator = strchr(text, '-');
+    if (!separator) return 0;
+    char *end;
+    *milliseconds = strtoll(text, &end, 10);
+    if (end != separator) return 0;
+    *sequence = strtoll(separator + 1, &end, 10);
+    return *separator != '\0' && *end == '\0';
+}
+
 static void reply_array_header(int fd, long long count) {
     char response[64];
     int length = snprintf(response, sizeof(response), "*%lld\r\n", count);
@@ -175,6 +223,39 @@ static void free_args(char **args, size_t count) {
     for (size_t i = 0; i < count; i++) free(args[i]);
 }
 
+static void clear_queue(ClientState *client) {
+    for (size_t i = 0; i < client->queue_count; i++) {
+        free_args(client->queue[i].args, client->queue[i].count);
+        free(client->queue[i].args);
+    }
+    free(client->queue);
+    client->queue = NULL;
+    client->queue_count = 0;
+    client->queue_capacity = 0;
+}
+
+static int queue_command(ClientState *client, char **args, size_t count) {
+    if (client->queue_count == client->queue_capacity) {
+        size_t capacity = client->queue_capacity ? client->queue_capacity * 2 : 8;
+        QueuedCommand *queue = realloc(client->queue, capacity * sizeof(*queue));
+        if (!queue) return 0;
+        client->queue = queue;
+        client->queue_capacity = capacity;
+    }
+    char **copy = calloc(count, sizeof(*copy));
+    if (!copy) return 0;
+    for (size_t i = 0; i < count; i++) {
+        copy[i] = strdup(args[i]);
+        if (!copy[i]) {
+            free_args(copy, i);
+            free(copy);
+            return 0;
+        }
+    }
+    client->queue[client->queue_count++] = (QueuedCommand){copy, count};
+    return 1;
+}
+
 static int equals(const char *left, const char *right) {
     while (*left && *right) {
         char a = *left++;
@@ -193,7 +274,47 @@ static int parse_integer(const char *text, long long *value) {
     return errno == 0 && *text != '\0' && *end == '\0';
 }
 
-static void command(int fd, char **args, size_t count) {
+static void command(ClientState *client, char **args, size_t count) {
+    int fd = client->fd;
+    if (client->in_multi && !client->executing &&
+        !equals(args[0], "MULTI") && !equals(args[0], "EXEC") &&
+        !equals(args[0], "DISCARD")) {
+        if (queue_command(client, args, count)) reply_simple(fd, "QUEUED");
+        else reply_error(fd, "transaction queue is full");
+        return;
+    }
+    if (equals(args[0], "MULTI") && count == 1) {
+        if (client->in_multi) reply_error(fd, "MULTI calls can not be nested");
+        else {
+            client->in_multi = 1;
+            reply_simple(fd, "OK");
+        }
+        return;
+    }
+    if (equals(args[0], "DISCARD") && count == 1) {
+        if (!client->in_multi) reply_error(fd, "DISCARD without MULTI");
+        else {
+            client->in_multi = 0;
+            clear_queue(client);
+            reply_simple(fd, "OK");
+        }
+        return;
+    }
+    if (equals(args[0], "EXEC") && count == 1) {
+        if (!client->in_multi) {
+            reply_error(fd, "EXEC without MULTI");
+            return;
+        }
+        reply_array_header(fd, (long long)client->queue_count);
+        client->executing = 1;
+        for (size_t i = 0; i < client->queue_count; i++) {
+            command(client, client->queue[i].args, client->queue[i].count);
+        }
+        client->executing = 0;
+        client->in_multi = 0;
+        clear_queue(client);
+        return;
+    }
     if (equals(args[0], "PING")) {
         if (count == 1) reply_simple(fd, "PONG");
         else if (count == 2) reply_bulk(fd, args[1], strlen(args[1]));
@@ -284,7 +405,111 @@ static void command(int fd, char **args, size_t count) {
     }
     if (equals(args[0], "TYPE") && count == 2) {
         Entry *entry = find_entry(args[1]);
-        reply_simple(fd, entry ? (entry->type == VALUE_LIST ? "list" : "string") : "none");
+        if (!entry) reply_simple(fd, "none");
+        else if (entry->type == VALUE_LIST) reply_simple(fd, "list");
+        else if (entry->type == VALUE_STREAM) reply_simple(fd, "stream");
+        else reply_simple(fd, "string");
+        return;
+    }
+    if (equals(args[0], "XADD") && count >= 5 && (count % 2) == 1) {
+        Entry *entry = get_entry(args[1], 1, VALUE_STREAM);
+        if (!entry || entry->type != VALUE_STREAM) { reply_error(fd, "wrong type"); return; }
+        long long milliseconds, sequence;
+        if (strcmp(args[2], "*") == 0) {
+            milliseconds = now_ms();
+            sequence = milliseconds == entry->last_stream_ms ? entry->last_stream_sequence + 1 : 0;
+        } else if (!parse_stream_id(args[2], &milliseconds, &sequence)) {
+            reply_error(fd, "invalid stream ID");
+            return;
+        } else if (milliseconds < entry->last_stream_ms ||
+                   (milliseconds == entry->last_stream_ms && sequence <= entry->last_stream_sequence)) {
+            reply_error(fd, "ID specified in XADD is equal or smaller than the target stream top item");
+            return;
+        }
+        if (milliseconds == 0 && sequence == 0) { reply_error(fd, "The ID specified in XADD must be greater than 0-0"); return; }
+        if (entry->record_count == entry->record_capacity) {
+            size_t capacity = entry->record_capacity ? entry->record_capacity * 2 : 8;
+            StreamRecord *records = realloc(entry->records, capacity * sizeof(*records));
+            if (!records) { reply_error(fd, "out of memory"); return; }
+            entry->records = records;
+            entry->record_capacity = capacity;
+        }
+        StreamRecord *record = &entry->records[entry->record_count++];
+        record->milliseconds = milliseconds;
+        record->sequence = sequence;
+        record->field_count = count - 3;
+        record->fields = calloc(record->field_count, sizeof(*record->fields));
+        if (!record->fields) { entry->record_count--; reply_error(fd, "out of memory"); return; }
+        for (size_t i = 0; i < record->field_count; i++) {
+            record->fields[i].data = strdup(args[i + 3]);
+            record->fields[i].length = strlen(args[i + 3]);
+        }
+        entry->last_stream_ms = milliseconds;
+        entry->last_stream_sequence = sequence;
+        reply_stream_id(fd, milliseconds, sequence);
+        return;
+    }
+    if (equals(args[0], "XRANGE") && count == 4) {
+        Entry *entry = find_entry(args[1]);
+        if (!entry || entry->type != VALUE_STREAM) { reply_array_header(fd, 0); return; }
+        long long start_ms = 0, start_seq = 0, end_ms = LLONG_MAX, end_seq = LLONG_MAX;
+        if (strcmp(args[2], "-") != 0 && !parse_stream_id(args[2], &start_ms, &start_seq)) {
+            reply_error(fd, "invalid stream ID"); return;
+        }
+        if (strcmp(args[3], "+") != 0 && !parse_stream_id(args[3], &end_ms, &end_seq)) {
+            reply_error(fd, "invalid stream ID"); return;
+        }
+        size_t matches = 0;
+        for (size_t i = 0; i < entry->record_count; i++) {
+            StreamRecord *record = &entry->records[i];
+            int after_start = record->milliseconds > start_ms ||
+                (record->milliseconds == start_ms && record->sequence >= start_seq);
+            int before_end = record->milliseconds < end_ms ||
+                (record->milliseconds == end_ms && record->sequence <= end_seq);
+            if (after_start && before_end) matches++;
+        }
+        reply_array_header(fd, (long long)matches);
+        for (size_t i = 0; i < entry->record_count; i++) {
+            StreamRecord *record = &entry->records[i];
+            int after_start = record->milliseconds > start_ms ||
+                (record->milliseconds == start_ms && record->sequence >= start_seq);
+            int before_end = record->milliseconds < end_ms ||
+                (record->milliseconds == end_ms && record->sequence <= end_seq);
+            if (!after_start || !before_end) continue;
+            reply_array_header(fd, 2);
+            reply_stream_id(fd, record->milliseconds, record->sequence);
+            reply_array_header(fd, (long long)record->field_count);
+            for (size_t j = 0; j < record->field_count; j++)
+                reply_bulk(fd, record->fields[j].data, record->fields[j].length);
+        }
+        return;
+    }
+    if (equals(args[0], "XREAD") && count == 4 && equals(args[1], "STREAMS")) {
+        Entry *entry = find_entry(args[2]);
+        long long after_ms, after_seq;
+        if (!parse_stream_id(args[3], &after_ms, &after_seq)) { reply_error(fd, "invalid stream ID"); return; }
+        if (!entry || entry->type != VALUE_STREAM) { reply_null_array(fd); return; }
+        size_t matches = 0;
+        for (size_t i = 0; i < entry->record_count; i++) {
+            StreamRecord *record = &entry->records[i];
+            if (record->milliseconds > after_ms ||
+                (record->milliseconds == after_ms && record->sequence > after_seq)) matches++;
+        }
+        if (matches == 0) { reply_null_array(fd); return; }
+        reply_array_header(fd, 1);
+        reply_array_header(fd, 2);
+        reply_bulk(fd, args[2], strlen(args[2]));
+        reply_array_header(fd, (long long)matches);
+        for (size_t i = 0; i < entry->record_count; i++) {
+            StreamRecord *record = &entry->records[i];
+            if (record->milliseconds < after_ms ||
+                (record->milliseconds == after_ms && record->sequence <= after_seq)) continue;
+            reply_array_header(fd, 2);
+            reply_stream_id(fd, record->milliseconds, record->sequence);
+            reply_array_header(fd, (long long)record->field_count);
+            for (size_t j = 0; j < record->field_count; j++)
+                reply_bulk(fd, record->fields[j].data, record->fields[j].length);
+        }
         return;
     }
     if ((equals(args[0], "INCR") || equals(args[0], "DECR")) && count == 2) {
@@ -467,8 +692,8 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--port") == 0) port = atoi(argv[++i]);
     }
     int server = create_server(port);
-    int clients[MAX_CLIENTS];
-    for (size_t i = 0; i < MAX_CLIENTS; i++) clients[i] = -1;
+    ClientState clients[MAX_CLIENTS] = {0};
+    for (size_t i = 0; i < MAX_CLIENTS; i++) clients[i].fd = -1;
     printf("Redis clone listening on port %d\n", port);
     for (;;) {
         fd_set readable;
@@ -476,9 +701,9 @@ int main(int argc, char **argv) {
         FD_SET(server, &readable);
         int highest = server;
         for (size_t i = 0; i < MAX_CLIENTS; i++) {
-            if (clients[i] < 0) continue;
-            FD_SET(clients[i], &readable);
-            if (clients[i] > highest) highest = clients[i];
+            if (clients[i].fd < 0) continue;
+            FD_SET(clients[i].fd, &readable);
+            if (clients[i].fd > highest) highest = clients[i].fd;
         }
         if (select(highest + 1, &readable, NULL, NULL, NULL) < 0) {
             if (errno == EINTR) continue;
@@ -489,22 +714,29 @@ int main(int argc, char **argv) {
             int client = accept(server, NULL, NULL);
             if (client >= 0) {
                 for (size_t i = 0; i < MAX_CLIENTS; i++) {
-                    if (clients[i] < 0) { clients[i] = client; client = -1; break; }
+                    if (clients[i].fd < 0) {
+                        clients[i].fd = client;
+                        clients[i].in_multi = 0;
+                        clients[i].executing = 0;
+                        client = -1;
+                        break;
+                    }
                 }
                 if (client >= 0) close(client);
             }
         }
         for (size_t i = 0; i < MAX_CLIENTS; i++) {
-            if (clients[i] < 0 || !FD_ISSET(clients[i], &readable)) continue;
+            if (clients[i].fd < 0 || !FD_ISSET(clients[i].fd, &readable)) continue;
             char *args[MAX_ARGS] = {0};
             size_t count = 0;
-            if (!read_command(clients[i], args, &count)) {
-                close(clients[i]);
-                clients[i] = -1;
+            if (!read_command(clients[i].fd, args, &count)) {
+                close(clients[i].fd);
+                clear_queue(&clients[i]);
+                clients[i].fd = -1;
                 free_args(args, count);
                 continue;
             }
-            command(clients[i], args, count);
+            command(&clients[i], args, count);
             free_args(args, count);
         }
     }
