@@ -117,6 +117,10 @@ static void reply_null(int fd) {
     send_all(fd, "$-1\r\n", 5);
 }
 
+static void reply_null_array(int fd) {
+    send_all(fd, "*-1\r\n", 5);
+}
+
 static void reply_array_header(int fd, long long count) {
     char response[64];
     int length = snprintf(response, sizeof(response), "*%lld\r\n", count);
@@ -182,6 +186,13 @@ static int equals(const char *left, const char *right) {
     return *left == '\0' && *right == '\0';
 }
 
+static int parse_integer(const char *text, long long *value) {
+    char *end;
+    errno = 0;
+    *value = strtoll(text, &end, 10);
+    return errno == 0 && *text != '\0' && *end == '\0';
+}
+
 static void command(int fd, char **args, size_t count) {
     if (equals(args[0], "PING")) {
         if (count == 1) reply_simple(fd, "PONG");
@@ -194,18 +205,35 @@ static void command(int fd, char **args, size_t count) {
         return;
     }
     if (equals(args[0], "SET") && count >= 3) {
+        int only_if_missing = 0;
+        int only_if_present = 0;
+        int64_t expiry = 0;
+        for (size_t i = 3; i < count; i++) {
+            if (equals(args[i], "NX")) only_if_missing = 1;
+            else if (equals(args[i], "XX")) only_if_present = 1;
+            else if ((equals(args[i], "EX") || equals(args[i], "PX")) && i + 1 < count) {
+                long long duration;
+                if (!parse_integer(args[++i], &duration) || duration <= 0) {
+                    reply_error(fd, "invalid expire time");
+                    return;
+                }
+                expiry = now_ms() + duration * (equals(args[i - 1], "EX") ? 1000 : 1);
+            } else {
+                reply_error(fd, "syntax error");
+                return;
+            }
+        }
+        Entry *existing = find_entry(args[1]);
+        if ((only_if_missing && existing) || (only_if_present && !existing)) {
+            reply_null(fd);
+            return;
+        }
         Entry *entry = get_entry(args[1], 1, VALUE_STRING);
         if (!entry) { reply_error(fd, "maximum key limit reached"); return; }
         if (entry->type != VALUE_STRING) { reply_error(fd, "wrong type"); return; }
         free(entry->string);
         entry->string = strdup(args[2]);
-        entry->expires_at_ms = 0;
-        for (size_t i = 3; i + 1 < count; i += 2) {
-            if (equals(args[i], "EX") || equals(args[i], "PX")) {
-                long long duration = strtoll(args[i + 1], NULL, 10);
-                entry->expires_at_ms = now_ms() + duration * (equals(args[i], "EX") ? 1000 : 1);
-            }
-        }
+        entry->expires_at_ms = expiry;
         reply_simple(fd, "OK");
         return;
     }
@@ -214,6 +242,29 @@ static void command(int fd, char **args, size_t count) {
         if (!entry) reply_null(fd);
         else if (entry->type != VALUE_STRING) reply_error(fd, "wrong type");
         else reply_bulk(fd, entry->string, strlen(entry->string));
+        return;
+    }
+    if (equals(args[0], "MGET") && count >= 2) {
+        reply_array_header(fd, (long long)count - 1);
+        for (size_t i = 1; i < count; i++) {
+            Entry *entry = find_entry(args[i]);
+            if (!entry || entry->type != VALUE_STRING) reply_null(fd);
+            else reply_bulk(fd, entry->string, strlen(entry->string));
+        }
+        return;
+    }
+    if (equals(args[0], "MSET") && count >= 3 && (count % 2) == 1) {
+        for (size_t i = 1; i < count; i += 2) {
+            Entry *entry = get_entry(args[i], 1, VALUE_STRING);
+            if (!entry || entry->type != VALUE_STRING) {
+                reply_error(fd, "wrong type");
+                return;
+            }
+            free(entry->string);
+            entry->string = strdup(args[i + 1]);
+            entry->expires_at_ms = 0;
+        }
+        reply_simple(fd, "OK");
         return;
     }
     if (equals(args[0], "DEL") && count >= 2) {
@@ -239,15 +290,83 @@ static void command(int fd, char **args, size_t count) {
     if ((equals(args[0], "INCR") || equals(args[0], "DECR")) && count == 2) {
         Entry *entry = get_entry(args[1], 1, VALUE_STRING);
         if (!entry || entry->type != VALUE_STRING) { reply_error(fd, "value is not an integer"); return; }
-        char *end;
-        long long value = strtoll(entry->string ? entry->string : "0", &end, 10);
-        if (*end != '\0') { reply_error(fd, "value is not an integer"); return; }
+        long long value;
+        if (!parse_integer(entry->string ? entry->string : "0", &value)) {
+            reply_error(fd, "value is not an integer");
+            return;
+        }
         value += equals(args[0], "INCR") ? 1 : -1;
         char number[64];
         snprintf(number, sizeof(number), "%lld", value);
         free(entry->string);
         entry->string = strdup(number);
         reply_integer(fd, value);
+        return;
+    }
+    if ((equals(args[0], "INCRBY") || equals(args[0], "DECRBY")) && count == 3) {
+        long long delta;
+        if (!parse_integer(args[2], &delta)) { reply_error(fd, "value is not an integer"); return; }
+        Entry *entry = get_entry(args[1], 1, VALUE_STRING);
+        if (!entry || entry->type != VALUE_STRING) { reply_error(fd, "value is not an integer"); return; }
+        long long value;
+        if (!parse_integer(entry->string ? entry->string : "0", &value)) {
+            reply_error(fd, "value is not an integer");
+            return;
+        }
+        value += equals(args[0], "INCRBY") ? delta : -delta;
+        char number[64];
+        snprintf(number, sizeof(number), "%lld", value);
+        free(entry->string);
+        entry->string = strdup(number);
+        reply_integer(fd, value);
+        return;
+    }
+    if (equals(args[0], "APPEND") && count == 3) {
+        Entry *entry = get_entry(args[1], 1, VALUE_STRING);
+        if (!entry || entry->type != VALUE_STRING) { reply_error(fd, "wrong type"); return; }
+        size_t old_length = entry->string ? strlen(entry->string) : 0;
+        size_t added_length = strlen(args[2]);
+        char *value = realloc(entry->string, old_length + added_length + 1);
+        if (!value) { reply_error(fd, "out of memory"); return; }
+        memcpy(value + old_length, args[2], added_length + 1);
+        entry->string = value;
+        reply_integer(fd, (long long)(old_length + added_length));
+        return;
+    }
+    if (equals(args[0], "STRLEN") && count == 2) {
+        Entry *entry = find_entry(args[1]);
+        if (!entry) reply_integer(fd, 0);
+        else if (entry->type != VALUE_STRING) reply_error(fd, "wrong type");
+        else reply_integer(fd, (long long)strlen(entry->string));
+        return;
+    }
+    if ((equals(args[0], "EXPIRE") || equals(args[0], "PEXPIRE")) && count == 3) {
+        long long duration;
+        if (!parse_integer(args[2], &duration)) { reply_error(fd, "invalid expire time"); return; }
+        Entry *entry = find_entry(args[1]);
+        if (!entry) reply_integer(fd, 0);
+        else {
+            entry->expires_at_ms = now_ms() + duration * (equals(args[0], "EXPIRE") ? 1000 : 1);
+            if (duration <= 0) free_entry(entry);
+            reply_integer(fd, 1);
+        }
+        return;
+    }
+    if ((equals(args[0], "TTL") || equals(args[0], "PTTL")) && count == 2) {
+        Entry *entry = find_entry(args[1]);
+        if (!entry) reply_integer(fd, -2);
+        else if (entry->expires_at_ms == 0) reply_integer(fd, -1);
+        else {
+            int64_t remaining = entry->expires_at_ms - now_ms();
+            if (remaining <= 0) { free_entry(entry); reply_integer(fd, -2); }
+            else reply_integer(fd, equals(args[0], "TTL") ? (remaining + 999) / 1000 : remaining);
+        }
+        return;
+    }
+    if (equals(args[0], "PERSIST") && count == 2) {
+        Entry *entry = find_entry(args[1]);
+        if (!entry || entry->expires_at_ms == 0) reply_integer(fd, 0);
+        else { entry->expires_at_ms = 0; reply_integer(fd, 1); }
         return;
     }
     if ((equals(args[0], "LPUSH") || equals(args[0], "RPUSH")) && count >= 3) {
@@ -316,27 +435,41 @@ static void command(int fd, char **args, size_t count) {
         if (entry->count == 0) free_entry(entry);
         return;
     }
+    if (equals(args[0], "FLUSHALL") && count == 1) {
+        for (size_t i = 0; i < MAX_KEYS; i++) free_entry(&store[i]);
+        reply_simple(fd, "OK");
+        return;
+    }
+    if (equals(args[0], "QUIT") && count == 1) {
+        reply_simple(fd, "OK");
+        shutdown(fd, SHUT_RDWR);
+        return;
+    }
     reply_error(fd, "unknown command");
 }
 
-static int create_server(void) {
+static int create_server(int port) {
     int server = socket(AF_INET, SOCK_STREAM, 0);
     if (server < 0) { perror("socket"); exit(1); }
     int reuse = 1;
     if (setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) { perror("setsockopt"); exit(1); }
-    struct sockaddr_in address = {.sin_family = AF_INET, .sin_port = htons(PORT), .sin_addr.s_addr = htonl(INADDR_ANY)};
+    struct sockaddr_in address = {.sin_family = AF_INET, .sin_port = htons((uint16_t)port), .sin_addr.s_addr = htonl(INADDR_ANY)};
     if (bind(server, (struct sockaddr *)&address, sizeof(address)) < 0) { perror("bind"); exit(1); }
     if (listen(server, 16) < 0) { perror("listen"); exit(1); }
     return server;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     setbuf(stdout, NULL);
-    int server = create_server();
+    int port = PORT;
+    for (int i = 1; i + 1 < argc; i++) {
+        if (strcmp(argv[i], "--port") == 0) port = atoi(argv[++i]);
+    }
+    int server = create_server(port);
     int clients[MAX_CLIENTS];
     for (size_t i = 0; i < MAX_CLIENTS; i++) clients[i] = -1;
-    printf("Redis clone listening on port %d\n", PORT);
+    printf("Redis clone listening on port %d\n", port);
     for (;;) {
         fd_set readable;
         FD_ZERO(&readable);
