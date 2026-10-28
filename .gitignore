@@ -52,4 +52,7 @@ Mkfile.old
 dkms.conf
 
 build
+build-asan
+build-rel
 vcpkg_installed
+*.aof
