@@ -56,3 +56,5 @@ build-asan
 build-rel
 vcpkg_installed
 *.aof
+__pycache__/
+*.pyc
